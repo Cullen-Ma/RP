@@ -14,7 +14,7 @@ The method allows for the generation of bootstrap replicates of dynamic PET data
 *   PyTorch
 *   Tqdm
 
-Run in sequence:
+## Run in sequence:
 1. cluster.py
 2. elastic_regression_simulation_final_bootstrap.py
 3. iterate_sigma_phi_h.py
