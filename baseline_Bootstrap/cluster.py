@@ -1,55 +1,59 @@
 import numpy as np
-import matplotlib.pyplot as plt
-from scipy import stats
 import pandas as pd
-import torch
 from sklearn.cluster import KMeans
-from sklearn.cluster import DBSCAN
-from sklearn.metrics import davies_bouldin_score
-from sklearn.preprocessing import StandardScaler 
-from sklearn.decomposition import PCA
-from matplotlib.colors import ListedColormap
-from sklearn.manifold import TSNE
-from matplotlib.colors import LinearSegmentedColormap
-import SimpleITK as sitk
-from matplotlib.colors import ListedColormap, to_rgba
-import pdb
+import argparse
+import os
+from utils import check_dir
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-##change!!
-img = np.load('/share/home/kma/metabolism/data_bj_nodule_hospital/additional1_ks3/img_cut_slicer.npy')
-itk_img=sitk.ReadImage('/share/home/kma/metabolism/data_bj_nodule_hospital/additional1/seg_pkc_1.nii')
-seg = sitk.GetArrayFromImage(itk_img)
-seg = seg[85,:,:]
-frame = 86
-z,y = np.where(seg == 1)
-time_curves = img[:, z,y]
-time_curves =time_curves.T
-df = pd.DataFrame(time_curves)
-df = df.fillna(method='ffill').fillna(method='bfill')
-time_curves = df.values
-cluster_kind = 12
-kmeans = KMeans(n_clusters=cluster_kind, max_iter = 600,random_state=0)
-kmeans.fit(time_curves)
-cluster_labels = kmeans.labels_
-distinct_elements = set(cluster_labels)
-print(f'distinct_elements={cluster_labels.shape}')
-np.save('/share/home/kma/metabolism/data_bj_nodule_hospital/additional1_ks3/slice62_cluster60/label_cluster_tac_kmeans_12.npy',cluster_labels)
-seg[z,y] = cluster_labels+1
-unique_labels = np.unique(seg)
-unique_labels = unique_labels.astype(int)
-plt.rcParams.update({'font.size': 12})
-
-custom_labels = ['D{}'.format(label) for label in unique_labels]
-slices = cluster_labels
-avg = np.zeros((cluster_kind,frame))
-for i in range(cluster_kind):
-    # 找到值为1的位置
-    positions = np.where(slices == i)[0]  # 只取行索引，假设您只关心行位置
-    tac = np.zeros((len(positions), frame))  # 使用 positions 的长度（行数）来初始化 tac 数组
-    for j, pos in enumerate(positions):
-        tac[j] = time_curves[pos, :]  # 使用 pos（行索引）来访问 time_curves 并赋值给 tac
-    avg[i, :] = np.mean(tac, axis=0)  # 计算这些位置的平均值
-print(avg)
-np.save('/share/home/kma/metabolism/data_bj_nodule_hospital/additional1_ks3/slice62_cluster60/avg_tac_kmeans_12.npy',avg)
+def run_clustering(data_path, mask_path, output_dir, n_clusters):
+    print(f"Loading data from {data_path}...")
+    # Assume input is (Time, Z, Y, X) or (Time, Voxels)
+    img = np.load(data_path) 
     
+    # Flatten data to (Voxels, Time) based on mask if provided, else just flatten
+    if mask_path:
+        mask = np.load(mask_path)
+        # Assuming img is [Time, Z, Y, X] and mask is [Z, Y, X]
+        time_points = img.shape[0]
+        masked_img = img[:, mask == 1] # Result: [Time, N_Voxels]
+        time_curves = masked_img.T     # Result: [N_Voxels, Time]
+    else:
+        # Assuming input is already [N_Voxels, Time] or reshaped
+        if img.ndim > 2:
+            time_curves = img.reshape(img.shape[0], -1).T
+        else:
+            time_curves = img
+            
+    # Handle NaNs
+    df = pd.DataFrame(time_curves)
+    df = df.fillna(method='ffill').fillna(method='bfill')
+    time_curves = df.values
+
+    print(f"Clustering into {n_clusters} clusters...")
+    kmeans = KMeans(n_clusters=n_clusters, max_iter=600, random_state=0)
+    kmeans.fit(time_curves)
+    cluster_labels = kmeans.labels_
+
+    # Calculate Average TACs (Basis Functions X)
+    frames = time_curves.shape[1]
+    avg_tac = np.zeros((n_clusters, frames))
+    
+    for i in range(n_clusters):
+        positions = np.where(cluster_labels == i)[0]
+        if len(positions) > 0:
+            avg_tac[i, :] = np.mean(time_curves[positions, :], axis=0)
+            
+    check_dir(output_dir)
+    np.save(os.path.join(output_dir, 'cluster_labels.npy'), cluster_labels)
+    np.save(os.path.join(output_dir, 'avg_tac.npy'), avg_tac)
+    print("Clustering complete. Results saved.")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data', type=str, required=True, help='Path to 4D PET npy file')
+    parser.add_argument('--mask', type=str, default=None, help='Path to binary mask npy file')
+    parser.add_argument('--out', type=str, default='./results/step1', help='Output directory')
+    parser.add_argument('--clusters', type=int, default=12, help='Number of clusters')
+    args = parser.parse_args()
+    
+    run_clustering(args.data, args.mask, args.out, args.clusters)
