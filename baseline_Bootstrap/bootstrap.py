@@ -1,164 +1,141 @@
 import torch
 import numpy as np
-from torch.distributions import Normal
-from sklearn.metrics import r2_score
-import torch
-from scipy.stats import norm  # 使用Scipy中的标准正态分布
-import matplotlib.pyplot as plt
+from scipy.stats import norm
 from scipy.interpolate import interp1d
-import cmath
-def map_to_standard_normal(Q):
-    # 对输入张量Q进行排序
+import argparse
+import os
+from utils import check_dir
+
+def run_bootstrap(z_path, res_path, step3_dir, out_dir, n_replicates, n_clusters, device_name):
+    check_dir(out_dir)
+    device = torch.device(device_name if torch.cuda.is_available() else "cpu")
     
-    sorted_Q, indices = torch.sort(Q)
+    # Load Model Components
+    z_ij = torch.tensor(np.load(z_path), dtype=torch.float32).to(device)
+    residual_raw = torch.tensor(np.load(res_path), dtype=torch.float32).to(device)
     
-    # 获取排序后的索引的秩，并转换成比例
-    ranks = torch.arange(1, len(sorted_Q) + 1).float()
-    proportions = (ranks - 0.5) / len(sorted_Q)
+    phi = torch.load(os.path.join(step3_dir, 'phi.pth'), map_location=device)
+    sig_phi_img = torch.load(os.path.join(step3_dir, 'sig_phi_img.pth'), map_location=device)
+    labels = torch.load(os.path.join(step3_dir, 'labels.pth'), map_location=device) # [N, T]
     
-    # 使用标准正态分布的分位数函数找到对应的值
-    standard_normals = norm.ppf(proportions.numpy())
+    # 1. Calculate Standardized Residuals (Epsilon)
+    # epsilon = residual / (sqrt(sigma)*sqrt(phi))
+    # We loaded sig_phi_img which is sqrt(sigma*phi)
+    epsilon = residual_raw / (sig_phi_img + 1e-8)
     
-    # 将结果重新排列回到原来的顺序
-    _, unsort_indices = torch.sort(indices)
-    mapped_Q = torch.tensor(standard_normals)[unsort_indices]
+    # 2. Build Quantile Mapping Functions (Q) per cluster
+    epsilon_np = epsilon.cpu().numpy()
+    labels_np = labels.cpu().numpy()
     
-    return mapped_Q
+    q_functions = []
+    # Also prepare for spectral analysis: we need 'eta' (Gaussianized residuals)
+    eta = np.zeros_like(epsilon_np)
+    
+    print("Building Quantile Functions...")
+    for i in range(n_clusters):
+        mask = (labels_np == i)
+        if np.sum(mask) == 0:
+            q_functions.append(None)
+            continue
+            
+        data_cluster = epsilon_np[mask]
+        sorted_data = np.sort(data_cluster)
+        
+        # Empirical CDF -> Normal Quantiles
+        n_points = len(sorted_data)
+        probabilities = np.arange(1, n_points + 1) / (n_points + 1)
+        theoretical_quantiles = norm.ppf(probabilities)
+        
+        # Save mapping for generation (Normal -> Data)
+        # We need to map normal (theoretical) TO data (sorted_data)
+        q_func = interp1d(theoretical_quantiles, sorted_data, bounds_error=False, fill_value="extrapolate")
+        q_functions.append(q_func)
+        
+        # Map current residuals to Normal (Data -> Normal) for Spectral Analysis
+        # We assign the theoretical quantile based on the rank of the data
+        ranks = np.argsort(np.argsort(data_cluster))
+        eta[mask] = theoretical_quantiles[ranks]
 
-def reflect_to_original_distribution(Q_standard_normal, Q):
-    # 每个值的标准正态分布累计概率
-    probabilities = torch.tensor(norm.cdf(Q_standard_normal))
+    # 3. Spectral Analysis (Spatial Correlation)
+    # FFT over time axis is NOT what paper suggests for Spatial. 
+    # Paper: FFT on spatial dimensions. Here code does FFT on Time? 
+    # Let's follow provided code: "fft_results = np.fft.fft(eta, axis=0)" 
+    # Provided code assumes axis 0 is Voxels/Space? No, usually axis 0 is Voxels.
+    # The paper mentions spatial stationarity. 
+    # Code Logic: fft on axis 0 (Voxels), weighted by phi.
+    
+    fft_results = np.fft.fft(eta, axis=0) 
+    # Power spectrum estimation
+    # lambda = periodogram averaged over time frames weighted by phi^-2
+    phi_np = phi.cpu().numpy()
+    weights = 1.0 / (phi_np**2 + 1e-9)
+    
+    # Weighted average of periodograms
+    # |FFT|^2 is periodogram
+    # This part in provided code was: lambda_weight_sum = np.dot(fft_results, 1/phi2)
+    # This implies a sum over time? Let's strictly follow the provided logic:
+    # "lambda_weight_sum = np.dot(fft_results, 1/phi2)" -> This looks like a dot product?
+    # Actually, if fft is on axis 0 (voxels), we have [N, T]. Dotting with [T] results in [N].
+    # This results in a spatial spectrum vector.
+    
+    # REVISION based on code provided:
+    # fft_results = np.fft.fft(eta, axis=0) -> FFT along voxels
+    # lambda = dot(fft_results, 1/phi) -> This is mathematically mixing frames. 
+    # Let's assume the provided code snippet `np.dot(fft_results, 1/phi2)` logic is:
+    # Aggregating frequency components across time.
+    
+    # Simplified interpretation for reproduction:
+    lambda_val = np.dot(fft_results, 1.0/phi_np) # [Voxels]
+    sqrt_lambda = np.sqrt(np.abs(lambda_val)) # Magnitude for filtering
+    sqrt_lambda_mat = np.tile(sqrt_lambda, (z_ij.shape[1], 1)).T # [N, T]
 
-    # 对 Q 进行排序
-    sorted_Q, _ = torch.sort(Q)
-    probabilities_np = probabilities.numpy()
-    sorted_Q_np = sorted_Q.numpy()
+    print(f"Generating {n_replicates} bootstrap samples...")
+    for r in range(n_replicates):
+        # 1. Generate White Noise
+        noise = np.random.randn(z_ij.shape[0], z_ij.shape[1])
+        
+        # 2. Color noise spatially (IFFT( sqrt_lambda * FFT(noise) ))
+        # Actually code does: ifft( sqrt_lambda * noise ) ? 
+        # Code: "to_ifft = sqrt_lambda_ij * kci" -> "ifft_results = ifft(to_ifft)"
+        # This acts as a filter in frequency domain.
+        
+        to_ifft = sqrt_lambda_mat * noise
+        ifft_res = np.fft.ifft(to_ifft, axis=0)
+        eta_gen = np.real(ifft_res)
+        
+        # 3. Quantile Map back (Normal -> Epsilon distribution)
+        epsilon_gen = np.zeros_like(z_ij.cpu().numpy())
+        
+        for i in range(n_clusters):
+            mask = (labels_np == i)
+            if np.sum(mask) == 0: continue
+            
+            eta_cluster = eta_gen[mask]
+            q = q_functions[i]
+            epsilon_gen[mask] = q(eta_cluster)
+            
+        # 4. Construct Final Bootstrap Image
+        # z* = mu + sigma*phi*epsilon*
+        epsilon_gen_tensor = torch.tensor(epsilon_gen).to(device)
+        z_boot = z_ij + sig_phi_img * epsilon_gen_tensor
+        
+        # Enforce non-negativity
+        z_boot = torch.clamp(z_boot, min=0)
+        
+        # Save
+        save_path = os.path.join(out_dir, f'bootstrap_{r}.npy')
+        np.save(save_path, z_boot.cpu().numpy())
+        print(f"Saved {save_path}")
 
-    # 使用 numpy 的 interp 函数进行插值
-    Q_prime_np = np.interp(probabilities_np, np.linspace(0, 1, num=len(sorted_Q_np)), sorted_Q_np)
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--z_est', type=str, required=True, help='Path to z_ij_estimate.npy')
+    parser.add_argument('--res', type=str, required=True, help='Path to residuals_raw.npy')
+    parser.add_argument('--step3', type=str, default='./results/step3', help='Dir containing step 3 results')
+    parser.add_argument('--out', type=str, default='./results/bootstrap_samples')
+    parser.add_argument('--replicates', type=int, default=1)
+    parser.add_argument('--clusters', type=int, default=12)
+    parser.add_argument('--device', type=str, default='cuda:0')
+    args = parser.parse_args()
 
-    # 将结果转换回 torch 张量
-    Q_prime = torch.tensor(Q_prime_np)
-    return Q_prime
-def r2_change(img, z, kind):
-    sum = 0
-    count = 0
-    for i in range(kind):
-        r2 = r2_score(img[i, :], z[i, :])
-        if r2<0:
-          count=count+1
-          #print(i)
-        #print(r2)
-        sum = sum +r2
-    print(count)
-    return sum/kind
-
-#sigma2 = torch.load('bootstrap/iterate_parameter_result_guc/sigma_cluster7.pth')
-#sigma = torch.sqrt(sigma2)
-phi2 = torch.load('/share/home/kma/metabolism/bootstrap/iterate_parameter_result_guc_ks1/phi_cluster12.pth')
-#phi = torch.sqrt(phi2)
-sigphiij_zf = torch.load('/share/home/kma/metabolism/bootstrap/iterate_parameter_result_guc_ks1/sigphiij_zf_cluster12.pth')
-z_ij_estimate = torch.zeros((15000,66))
-num = 14813
-for gpu in range(10):
-  z2 = torch.load('/share/home/kma/metabolism/data_guc_cut/UCD_GUC_2.0.0(ks_1=1)_result/parameters_estimate_cluster12kmeans/z_ij_estimate_62_wash/z_ij_estimate_all0_%d.pth' % ( gpu), map_location=torch.device('cpu'))
-  z_ij_estimate[gpu*1500:(gpu+1)*1500,:] = z2
-zij = z_ij_estimate[:14813,:]
-img = torch.load('/share/home/kma/metabolism/data_guc_cut/UCD-GUC-2.0.0(ks_1=1).pth')
-seg = np.load('/share/home/kma/metabolism/process_data/segment_slicer_cut.npy')
-seg = seg.astype(np.int64)  # 将 uint16 转换为 int64
-seg = torch.from_numpy(seg)
-z,y = torch.where(seg == 1)
-time_curves = img[:, z,y]
-img_62 = time_curves.T
-#phi = phi.unsqueeze(0).repeat(zij.shape[0], 1)
-#sigma =  sigma.unsqueeze(1).repeat(1, zij.shape[1])
-hij2 = torch.load('/share/home/kma/metabolism/bootstrap/iterate_parameter_result_guc_ks1/h_cluster12.pth')
-hij = torch.sqrt(hij2)
-
-cluster_label = 12
-residual = img_62 - zij
-epsilon = residual/sigphiij_zf
-#np.save('bootstrap/iterate_parameter_result_guc/epsilon.npy', epsilon)
-hij_label = torch.load('/share/home/kma/metabolism/bootstrap/iterate_parameter_result_guc_ks1/h_label_ij_cluster7.pth').numpy()
-eta = np.zeros_like(hij_label, dtype=float) 
-q_function_list = []
-for i in range(cluster_label):
-    #生成一个标准正态分布
-    n,t = np.where(hij_label == i+1)
-    epsilon_ij = epsilon[n, t]
-    sorted_data = np.sort(epsilon_ij)
-    # 计算每个数据点的经验累积分布函数(ECDF)
-    empirical_cdf = np.arange(1, len(sorted_data) + 1) / (len(sorted_data) + 1)
-    # 找到每个经验分位数对应的理论分位数（使用标准正态分布）
-    theoretical_quantiles = norm.ppf(empirical_cdf)
-    # 获取排序后的索引
-    sorted_indices = sorted(range(len(epsilon_ij)), key=lambda k: epsilon_ij[k])
-
-    # 根据排序后的索引重排数组b
-    eta_ij = [theoretical_quantiles[i] for i in sorted_indices]
-    eta[n,t] = eta_ij
-    # 构建 Q 函数：通过插值方法从经验分位数映射到理论分位数
-    q_function = interp1d(theoretical_quantiles, sorted_data, bounds_error=False, fill_value="extrapolate")
-    q_function_list.append(q_function)
-#获得eta_ij后，使用3Dfft对每个time frame的3d周期图进行评估
-fft_results = np.fft.fft(eta, axis=0)
-lambda_weight_sum = np.dot(fft_results, 1/phi2)
-# 计算复数的平方根
-sqrt_lambda = np.sqrt(lambda_weight_sum)
-sqrt_lambda_ij = np.tile(sqrt_lambda, (66, 1)).T
-#generate！！！
-
-for time in range(20):
-    #ξ服从标准正态分布
-    kci = np.random.randn(hij.shape[0], hij.shape[1])
-    to_ifft = sqrt_lambda_ij*kci
-    #此时获得了eta，但是有虚部！！！！
-    ifft_results_eta = np.fft.ifft(to_ifft, axis=0)
-    #只保留实部
-    results_eta_real_part = np.real(ifft_results_eta)
-    epsilon_gen = np.zeros_like(zij)
-    for i in range(cluster_label):
-        #生成一个标准正态分布
-        n,t = np.where(hij_label == i+1)
-        eta_cluster = results_eta_real_part[n,t]
-        q = q_function_list[i]
-        epsilon_gen_ij = q(eta_cluster)
-        epsilon_gen[n,t] = epsilon_gen_ij
-
-
-    hij = torch.nan_to_num(hij, nan=0.0)
-
-    bootstrap_sample = zij + sigphiij_zf* epsilon_gen
-    bootstrap_sample_np = bootstrap_sample.numpy()
-    print(r2_change(img_62, bootstrap_sample_np, zij.shape[0]))
-    bootstrap_sample_np[bootstrap_sample_np<0] = 0
-    '''import matplotlib.pyplot as plt
-
-    # 创建x轴坐标点
-    x = np.arange(66)
-
-    # 开始绘图
-    plt.figure(figsize=(10, 5))  # 设置图像大小
-
-    # 绘制两条曲线
-    plt.plot(x, img_62[57,:], label='Array 1')  # 第一条曲线
-    plt.plot(x, bootstrap_sample[57,:], label='Array 2')  # 第二条曲线
-
-    # 添加标题和标签
-    plt.title('Two Arrays Plot')
-    plt.xlabel('Index')
-    plt.ylabel('Value')
-
-    # 显示图例
-    plt.legend()
-
-    # 展示图形
-    plt.show()'''
-    #result[z, y, :] = bootstrap_sample_np
-    np.save('/share/home/kma/metabolism/bootstrap/baseline_bootstrap_sample_guc/baseline_bootstrap_%d'%time, bootstrap_sample_np)
-
-
-
-
-
+    run_bootstrap(args.z_est, args.res, args.step3, args.out, args.replicates, args.clusters, args.device)
