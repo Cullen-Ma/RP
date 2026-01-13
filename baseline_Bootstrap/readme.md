@@ -14,10 +14,6 @@ The method allows for the generation of bootstrap replicates of dynamic PET data
 *   PyTorch
 *   Tqdm
 
-Install dependencies:
-```bash
-pip install numpy pandas scipy scikit-learn torch tqdm
-
 Run in sequence:
 1. cluster.py
 2. elastic_regression_simulation_final_bootstrap.py
